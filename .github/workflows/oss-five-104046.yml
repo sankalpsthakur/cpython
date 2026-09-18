@@ -1,0 +1,192 @@
+name: Windows same-file regression validation
+on:
+  push:
+    branches: [validation/gh-104046-20260918]
+    paths: [.github/workflows/oss-five-104046.yml]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/cpython'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 23852543ed8026457cca5a6b8e19de819bbe58fe
+          persist-credentials: false
+      - name: Prepare evidence
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/base.txt
+      - name: Build Linux debug interpreter
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ./configure --with-pydebug --without-ensurepip > evidence/configure.log 2>&1
+          make -j4 > evidence/build.log 2>&1
+          echo PY_EXE=./python >> "$GITHUB_ENV"
+      - name: Build native Windows debug interpreter
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call PCbuild\build.bat -p x64 -c Debug -e > evidence\build.log 2>&1
+          if errorlevel 1 exit /b 1
+      - name: Set Windows interpreter path
+        if: runner.os == 'Windows'
+        run: echo PY_EXE=PCbuild/amd64/python_d.exe >> "$GITHUB_ENV"
+      - name: Add same-file and real junction regressions
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('Lib/test/test_shutil.py')
+          text = path.read_text()
+          anchor = '    def test_copyfile_same_file(self):'
+          assert text.count(anchor) == 1
+          new_tests = '''
+              def test_copyfile_same_file_direntry(self):
+                  src_dir = self.mkdtemp()
+                  src_file = os.path.join(src_dir, 'file')
+                  create_file(src_file, 'original contents')
+                  with os.scandir(src_dir) as entries:
+                      entry = next(entries)
+                  self.assertRaises(SameFileError, shutil.copyfile, entry, src_file)
+                  self.assertEqual(read_file(src_file), 'original contents')
+
+              def test_copyfile_distinct_file_direntry(self):
+                  src_dir = self.mkdtemp()
+                  dst_dir = self.mkdtemp()
+                  src_file = os.path.join(src_dir, 'file')
+                  dst_file = os.path.join(dst_dir, 'file')
+                  create_file(src_file, 'original contents')
+                  create_file(dst_file, 'old destination')
+                  with os.scandir(src_dir) as entries:
+                      entry = next(entries)
+                  shutil.copyfile(entry, dst_file)
+                  self.assertEqual(read_file(src_file), 'original contents')
+                  self.assertEqual(read_file(dst_file), 'original contents')
+
+          '''
+          import textwrap
+          new_tests = textwrap.indent(textwrap.dedent(new_tests), '    ')
+          text = text.replace(anchor, new_tests + anchor)
+          anchor = 'class TestCopyTree(BaseTest, unittest.TestCase):\n'
+          assert text.count(anchor) == 1
+          junction_test = '''
+              @unittest.skipUnless(_winapi, 'requires Windows junctions')
+              def test_copytree_same_file_through_junctions(self):
+                  root = self.mkdtemp()
+                  source = os.path.join(root, 'source')
+                  first = os.path.join(root, 'first')
+                  second = os.path.join(root, 'second')
+                  os.mkdir(source)
+                  os.mkdir(first)
+                  os.mkdir(second)
+                  source_file = os.path.join(source, 'file')
+                  for parent in (first, second):
+                      junction = os.path.join(parent, 'junction')
+                      _winapi.CreateJunction(source, junction)
+                  for copy_function in (shutil.copy, shutil.copy2):
+                      with self.subTest(copy_function=copy_function):
+                          create_file(source_file, 'original contents')
+                          self.assertRaises(shutil.Error, shutil.copytree,
+                                            first, second, dirs_exist_ok=True,
+                                            copy_function=copy_function)
+                          self.assertEqual(read_file(source_file), 'original contents')
+
+          '''
+          junction_test = textwrap.indent(textwrap.dedent(junction_test), '    ')
+          text = text.replace(anchor, anchor + junction_test)
+          path.write_text(text, newline='\n')
+          compile(text, str(path), 'exec')
+          PY
+      - name: Verify before-fix behavior twice
+        env:
+          EXPECT_FAILURE: ${{ runner.os == 'Windows' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          for n in 1 2; do
+            set +e
+            "$PY_EXE" -m unittest -v test.test_shutil.TestCopy.test_copyfile_same_file_direntry test.test_shutil.TestCopy.test_copyfile_distinct_file_direntry test.test_shutil.TestCopyTree.test_copytree_same_file_through_junctions > evidence/before-$n.log 2>&1
+            code=$?
+            set -e
+            test "$code" = "$EXPECT_FAILURE"
+            if test "$EXPECT_FAILURE" = 1; then
+              grep -q 'AssertionError' evidence/before-$n.log
+              if grep -q '^ERROR:' evidence/before-$n.log; then cat evidence/before-$n.log; exit 1; fi
+            fi
+          done
+      - name: Apply the minimal source fix and NEWS
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('Lib/shutil.py')
+          text = path.read_text()
+          old = "    if isinstance(src, os.DirEntry) and hasattr(os.path, 'samestat'):"
+          new = "    # DirEntry.stat() omits st_dev and st_ino on Windows.\n    if (not _WINDOWS and isinstance(src, os.DirEntry)\n            and hasattr(os.path, 'samestat')):"
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, new), newline='\n')
+          news = Path('Misc/NEWS.d/next/Library/2026-09-18-03-00-00.gh-issue-104046.Zj9Tr5.rst')
+          news.write_text('Fix same-file detection in :func:`shutil.copyfile` on Windows when the\nsource is an :class:`os.DirEntry`. This also prevents :func:`shutil.copytree`\nwith ``copy_function=shutil.copy`` from truncating a source file reached\nthrough directory junctions or symbolic links.\n', newline='\n')
+          PY
+      - name: Run fixed regressions and the full shutil suite
+        run: |
+          set -euo pipefail
+          "$PY_EXE" -VV | tee evidence/python.txt
+          "$PY_EXE" -m unittest -v test.test_shutil.TestCopy.test_copyfile_same_file_direntry test.test_shutil.TestCopy.test_copyfile_distinct_file_direntry test.test_shutil.TestCopyTree.test_copytree_same_file_through_junctions > evidence/after.log 2>&1
+          "$PY_EXE" -m test -v test_shutil > evidence/suite.log 2>&1
+          "$PY_EXE" -m test -R 3:3 -m '*direntry*' test_shutil > evidence/refleaks.log 2>&1
+          git add Lib/shutil.py Lib/test/test_shutil.py Misc/NEWS.d/next/Library/*gh-issue-104046*.rst
+          test "$(git diff --cached --name-only | wc -l)" = 3
+          git diff --cached --check
+          git diff --cached --binary > evidence/fix.patch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gh-104046-${{ matrix.os }}
+          path: evidence/
+          retention-days: 14
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 23852543ed8026457cca5a6b8e19de819bbe58fe
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gh-104046-*
+          path: evidence
+      - name: Publish the exact patch validated on both systems
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp evidence/ubuntu-24.04/fix.patch evidence/windows-2025/fix.patch 2>/dev/null || cmp evidence/gh-104046-ubuntu-24.04/fix.patch evidence/gh-104046-windows-2025/fix.patch
+          branch=fix/gh-104046-direntry-samefile
+          remote=$(git ls-remote --heads origin "refs/heads/$branch")
+          test -z "$remote"
+          git switch -c "$branch"
+          git apply --index evidence/gh-104046-ubuntu-24.04/fix.patch
+          git diff --cached --check
+          test "$(git diff --cached --name-only | wc -l)" = 3
+          git config user.name 'Sankalp Thakur'
+          git config user.email 'sankalphimself@gmail.com'
+          git commit -m 'gh-104046: Preserve same-file checks for Windows directory entries'
+          git rev-parse HEAD | tee evidence/head.txt
+          git push origin "HEAD:refs/heads/$branch"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gh-104046-publication
+          path: evidence/head.txt
+          retention-days: 14
