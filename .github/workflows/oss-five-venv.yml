@@ -1,0 +1,83 @@
+name: gh-157692 native Windows validation
+on:
+  push:
+    branches: [validation/gh-157692-20260918]
+permissions:
+  contents: write
+jobs:
+  regression:
+    if: github.repository == 'sankalpsthakur/cpython'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: sankalpsthakur/cpython
+          ref: 854295809ad5a42c9461f34d47b1252a3b4a2027
+          path: source
+      - name: Prepare regression tests
+        working-directory: source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ../evidence | Out-Null
+          python ../validation/Tools/oss-five/venv_prepare.py tests
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git diff --check
+      - name: Build native debug CPython
+        working-directory: source
+        shell: cmd
+        run: PCbuild\build.bat -p x64 -c Debug > ..\evidence\build-before.log 2>&1
+      - name: Require both regressions before the fix
+        working-directory: source
+        shell: pwsh
+        run: |
+          & PCbuild/amd64/python_d.exe -m test -v -m test_activate_bat_preserves_foreign_path test_venv *> ../evidence/before-test.log
+          $testStatus = $LASTEXITCODE
+          Get-Content ../evidence/before-test.log
+          if ($testStatus -eq 0) { throw 'Regression unexpectedly passed before the fix' }
+          if (!(Select-String -Path ../evidence/before-test.log -Pattern 'FAIL: test_activate_bat_preserves_foreign_path' -Quiet)) { throw 'Failure did not come from the regression assertion' }
+          & PCbuild/amd64/python_d.exe ../validation/Tools/oss-five/venv_prepare.py bash *> ../evidence/before-bash.log
+          $bashStatus = $LASTEXITCODE
+          Get-Content ../evidence/before-bash.log
+          if ($bashStatus -eq 0) { throw 'Git Bash repro unexpectedly passed before the fix' }
+          if (!(Select-String -Path ../evidence/before-bash.log -Pattern 'Git Bash activation failed' -Quiet)) { throw 'Git Bash repro failed for an unrelated reason' }
+          exit 0
+      - name: Apply fix and run venv tests
+        working-directory: source
+        shell: pwsh
+        run: |
+          python ../validation/Tools/oss-five/venv_prepare.py fix
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & PCbuild/amd64/python_d.exe -m test -v -u all test_venv *> ../evidence/after-test.log
+          $status = $LASTEXITCODE
+          Get-Content ../evidence/after-test.log
+          if ($status) { exit $status }
+          & PCbuild/amd64/python_d.exe ../validation/Tools/oss-five/venv_prepare.py bash *> ../evidence/after-bash.log
+          $status = $LASTEXITCODE
+          Get-Content ../evidence/after-bash.log
+          if ($status) { exit $status }
+      - name: Publish only validated source changes
+        working-directory: source
+        shell: pwsh
+        run: |
+          git add Lib/venv/scripts/nt/activate.bat Lib/venv/scripts/nt/deactivate.bat Lib/test/test_venv.py Misc/NEWS.d/next/Library/2026-09-18-01-30-00.gh-issue-157692.BatPath.rst
+          git diff --cached --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $files = @(git diff --cached --name-only)
+          if ($files.Count -ne 4) { throw 'Unexpected staged files' }
+          git diff --cached | Out-File -Encoding utf8 ../evidence/gh157692.patch
+          git -c user.name='Sankalp Thakur' -c user.email='31366524+sankalpsthakur@users.noreply.github.com' commit -m 'gh-157692: Isolate saved PATH state in venv batch scripts'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git push origin HEAD:refs/heads/fix/gh-157692-venv-batch-path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git rev-parse HEAD | Out-File ../evidence/commit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gh157692-evidence
+          path: evidence/
+          retention-days: 14
