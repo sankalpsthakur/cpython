@@ -14,10 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 1
       - name: Prepare exact upstream baseline and regression
         run: |
           cp .github/scripts/validate-gh157649.py "$RUNNER_TEMP/prepare.py"
+          git fetch --depth=1 origin 854295809ad5a42c9461f34d47b1252a3b4a2027
           git checkout --detach 854295809ad5a42c9461f34d47b1252a3b4a2027
           test "$(git rev-parse HEAD)" = 854295809ad5a42c9461f34d47b1252a3b4a2027
           python3 "$RUNNER_TEMP/prepare.py" tests
@@ -49,7 +50,7 @@ jobs:
           ./python -m test -u cpu -v test_cppext test_cext 2>&1 | tee "$RUNNER_TEMP/evidence/after.log"
       - name: Publish only the tested fix to a new branch
         run: |
-          git add Include/pyport.h Lib/test/test_cppext/extension.cpp 'Misc/NEWS.d/next/C API/2026-09-18-00-00-00.gh-issue-157649.CppRef.rst'
+          git add Include/pyport.h Lib/test/test_cppext/extension.cpp Misc/NEWS.d/next/C_API/2026-09-18-00-00-00.gh-issue-157649.CppRef.rst
           test "$(git diff --cached --name-only | wc -l)" -eq 3
           git diff --cached --check
           git diff --cached --binary > "$RUNNER_TEMP/evidence/fix.patch"

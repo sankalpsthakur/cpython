@@ -125,7 +125,7 @@ if sys.argv[1:] == ["tests"]:
     replace_once(path, anchor, "    if (test_refcount_lvalues() < 0) {\n        return -1;\n    }\n\n" + anchor)
 elif sys.argv[1:] == ["fix"]:
     replace_once("Include/pyport.h", OLD, NEW)
-    Path("Misc/NEWS.d/next/C API/2026-09-18-00-00-00.gh-issue-157649.CppRef.rst").write_text(
+    Path("Misc/NEWS.d/next/C_API/2026-09-18-00-00-00.gh-issue-157649.CppRef.rst").write_text(
         "Fix a C++ regression in :c:macro:`Py_CLEAR`, :c:macro:`Py_SETREF` and\n"
         ":c:macro:`Py_XSETREF` when the destination is an array item or a reference.\n"
         "The macros could decrement the wrong object's reference count or crash.\n"
