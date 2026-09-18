@@ -1,0 +1,155 @@
+name: Pickle numeric NUL regression validation
+on:
+  push:
+    branches: [validation/gh-126996-20260918]
+    paths: [.github/workflows/oss-five-126996.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/cpython'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 23852543ed8026457cca5a6b8e19de819bbe58fe
+      - name: Build a debug interpreter
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/base.txt
+          ./configure --with-pydebug --without-ensurepip > evidence/configure.log 2>&1
+          make -j4 > evidence/build.log 2>&1
+          ./python -VV | tee evidence/python.txt
+      - name: Add shared C and Python unpickler regressions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          path = Path('Lib/test/pickletester.py')
+          text = path.read_text()
+          anchor = '    def test_nondecimal_integers(self):'
+          assert text.count(anchor) == 1
+          tests = r'''
+              def test_null_bytes_in_numeric_opcodes(self):
+                  cases = (
+                      (b'I', b'1'), (b'I', b'00'), (b'I', b'01'),
+                      (b'I', b'123456789012345678901234567890'),
+                      (b'L', b'1'), (b'L', b'1L'),
+                      (b'L', b'-123456789012345678901234567890L'),
+                      (b'F', b'1.25'), (b'F', b'inf'), (b'F', b'nan'),
+                  )
+                  for opcode, argument in cases:
+                      for position in range(len(argument) + 1):
+                          for suffix in (b'', b'junk'):
+                              malformed = (argument[:position] + b'\x00' + suffix
+                                           + argument[position:])
+                              data = opcode + malformed + b'\n.'
+                              with self.subTest(data=data):
+                                  self.assertRaises(ValueError, self.loads, data)
+
+              def test_null_bytes_in_memo_indices(self):
+                  for argument in (b'0', b'00', b'1'):
+                      for position in range(len(argument) + 1):
+                          malformed = (argument[:position] + b'\x00'
+                                       + argument[position:])
+                          cases = (
+                              b'Np' + malformed + b'\n.',
+                              b'Np' + argument + b'\n0g' + malformed + b'\n.',
+                          )
+                          for data in cases:
+                              with self.subTest(data=data):
+                                  self.assertRaises(ValueError, self.loads, data)
+
+              def test_numeric_opcodes_without_null_bytes(self):
+                  cases = (
+                      (b'I00\n.', False), (b'I01\n.', True),
+                      (b'I-10\n.', -10), (b'I010\n.', 10),
+                      (b'I123456789012345678901234567890\n.',
+                       123456789012345678901234567890),
+                      (b'L10\n.', 10), (b'L10L\n.', 10),
+                      (b'L-123456789012345678901234567890L\n.',
+                       -123456789012345678901234567890),
+                      (b'F1.25\n.', 1.25), (b'Finf\n.', float('inf')),
+                      (b'Np0\n0g0\n.', None), (b'Np00\n0g00\n.', None),
+                  )
+                  for data, expected in cases:
+                      with self.subTest(data=data):
+                          self.assert_is_copy(expected, self.loads(data))
+          '''
+          tests = textwrap.indent(textwrap.dedent(tests).strip('\n'), '    ')
+          path.write_text(text.replace(anchor, tests + '\n\n' + anchor))
+          compile(path.read_text(), str(path), 'exec')
+          PY
+      - name: Require C regression failures and Python control passes
+        run: |
+          set -euo pipefail
+          for n in 1 2; do
+            set +e
+            ./python -m unittest -v test.test_pickle.CUnpicklerTests.test_null_bytes_in_numeric_opcodes test.test_pickle.CUnpicklerTests.test_null_bytes_in_memo_indices > evidence/before-$n.log 2>&1
+            code=$?
+            set -e
+            test "$code" = 1
+            grep -q 'ValueError not raised' evidence/before-$n.log
+            if grep -q '^ERROR:' evidence/before-$n.log; then cat evidence/before-$n.log; exit 1; fi
+          done
+          ./python -m unittest -v test.test_pickle.PyUnpicklerTests.test_null_bytes_in_numeric_opcodes test.test_pickle.PyUnpicklerTests.test_null_bytes_in_memo_indices test.test_pickle.CUnpicklerTests.test_numeric_opcodes_without_null_bytes > evidence/before-controls.log 2>&1
+      - name: Reject NULs before C string conversion
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Modules/_pickle.c')
+          text = path.read_text()
+          for function, state in (('load_int', 'state'), ('load_long', 'state'),
+                                  ('load_float', 'state'), ('load_get', 'st'),
+                                  ('load_put', 'state')):
+              start = text.index('\n' + function + '(')
+              end = text.index('\n}\n', start) + 3
+              block = text[start:end]
+              marker = '    if (len < 2)\n        return bad_readline(' + state + ');\n'
+              assert block.count(marker) == 1, function
+              guard = '''    if (strlen(s) != (size_t)len) {
+                  PyErr_SetString(PyExc_ValueError, "null byte in numeric argument");
+                  return -1;
+              }
+          '''
+              # Keep the C indentation independent of YAML indentation.
+              guard = '    if (strlen(s) != (size_t)len) {\n' + '        PyErr_SetString(PyExc_ValueError, "null byte in numeric argument");\n' + '        return -1;\n    }\n'
+              block = block.replace(marker, marker + guard)
+              text = text[:start] + block + text[end:]
+          path.write_text(text)
+          news = Path('Misc/NEWS.d/next/Library/2026-09-18-03-00-00.gh-issue-126996.Nu4Pv8.rst')
+          news.write_text('The C :mod:`pickle` unpickler now rejects embedded null bytes in the\ntextual arguments of the INT, LONG, FLOAT, GET and PUT opcodes instead of\nsilently ignoring the remainder of the argument. This matches the Python\nimplementation.\n')
+          PY
+          make -j4 > evidence/rebuild.log 2>&1
+      - name: Verify both implementations and related suites
+        run: |
+          set -euo pipefail
+          ./python -m test -v -m '*null_bytes*' test_pickle > evidence/after.log 2>&1
+          ./python -m test -v -j2 test_pickle test_pickletools test_copy test_shelve > evidence/suites.log 2>&1
+          ./python -m test -R 3:3 test_pickle > evidence/refleaks.log 2>&1
+          git diff --check
+      - name: Publish only the tested source and regression patch
+        run: |
+          set -euo pipefail
+          branch=fix/gh-126996-pickle-nul
+          remote=$(git ls-remote --heads origin "refs/heads/$branch")
+          test -z "$remote"
+          git switch -c "$branch"
+          git add Modules/_pickle.c Lib/test/pickletester.py Misc/NEWS.d/next/Library/*gh-issue-126996*.rst
+          test "$(git diff --cached --name-only | wc -l)" = 3
+          git diff --cached --check
+          git diff --cached --binary > evidence/fix.patch
+          git config user.name 'Sankalp Thakur'
+          git config user.email 'sankalphimself@gmail.com'
+          git commit -m 'gh-126996: Reject embedded null bytes in numeric pickle operands'
+          git rev-parse HEAD > evidence/head.txt
+          git rev-parse HEAD^{tree} > evidence/tree.txt
+          git push origin "HEAD:refs/heads/$branch"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gh-126996-evidence
+          path: evidence/
+          retention-days: 14
