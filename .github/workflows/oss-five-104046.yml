@@ -47,6 +47,7 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+          import textwrap
           path = Path('Lib/test/test_shutil.py')
           text = path.read_text()
           anchor = '    def test_copyfile_same_file(self):'
@@ -58,8 +59,10 @@ jobs:
                   create_file(src_file, 'original contents')
                   with os.scandir(src_dir) as entries:
                       entry = next(entries)
-                  self.assertRaises(SameFileError, shutil.copyfile, entry, src_file)
-                  self.assertEqual(read_file(src_file), 'original contents')
+                  try:
+                      self.assertRaises(SameFileError, shutil.copyfile, entry, src_file)
+                  finally:
+                      self.assertEqual(read_file(src_file), 'original contents')
 
               def test_copyfile_distinct_file_direntry(self):
                   src_dir = self.mkdtemp()
@@ -73,11 +76,9 @@ jobs:
                   shutil.copyfile(entry, dst_file)
                   self.assertEqual(read_file(src_file), 'original contents')
                   self.assertEqual(read_file(dst_file), 'original contents')
-
           '''
-          import textwrap
-          new_tests = textwrap.indent(textwrap.dedent(new_tests), '    ')
-          text = text.replace(anchor, new_tests + anchor)
+          new_tests = textwrap.indent(textwrap.dedent(new_tests).strip('\n'), '    ')
+          text = text.replace(anchor, new_tests + '\n\n' + anchor)
           anchor = 'class TestCopyTree(BaseTest, unittest.TestCase):\n'
           assert text.count(anchor) == 1
           junction_test = '''
@@ -96,15 +97,17 @@ jobs:
                       _winapi.CreateJunction(source, junction)
                   for copy_function in (shutil.copy, shutil.copy2):
                       with self.subTest(copy_function=copy_function):
-                          create_file(source_file, 'original contents')
-                          self.assertRaises(shutil.Error, shutil.copytree,
-                                            first, second, dirs_exist_ok=True,
-                                            copy_function=copy_function)
-                          self.assertEqual(read_file(source_file), 'original contents')
-
+                          with open(source_file, 'w') as fp:
+                              fp.write('original contents')
+                          try:
+                              self.assertRaises(shutil.Error, shutil.copytree,
+                                                first, second, dirs_exist_ok=True,
+                                                copy_function=copy_function)
+                          finally:
+                              self.assertEqual(read_file(source_file), 'original contents')
           '''
-          junction_test = textwrap.indent(textwrap.dedent(junction_test), '    ')
-          text = text.replace(anchor, anchor + junction_test)
+          junction_test = textwrap.indent(textwrap.dedent(junction_test).strip('\n'), '    ')
+          text = text.replace(anchor, anchor + '\n' + junction_test + '\n')
           path.write_text(text, newline='\n')
           compile(text, str(path), 'exec')
           PY
@@ -171,7 +174,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmp evidence/ubuntu-24.04/fix.patch evidence/windows-2025/fix.patch 2>/dev/null || cmp evidence/gh-104046-ubuntu-24.04/fix.patch evidence/gh-104046-windows-2025/fix.patch
+          cmp evidence/gh-104046-ubuntu-24.04/fix.patch evidence/gh-104046-windows-2025/fix.patch
           branch=fix/gh-104046-direntry-samefile
           remote=$(git ls-remote --heads origin "refs/heads/$branch")
           test -z "$remote"
