@@ -16,20 +16,20 @@ jobs:
           ref: 23852543ed8026457cca5a6b8e19de819bbe58fe
       - name: Preserve immutable source for inspection
         run: |
-          mkdir -p ../evidence ../source
-          git archive --format=tar.gz HEAD > ../source/cpython-2385254.tar.gz
-          git rev-parse HEAD > ../evidence/base.txt
+          mkdir -p evidence source_archive
+          git archive --format=tar.gz HEAD > source_archive/cpython-2385254.tar.gz
+          git rev-parse HEAD > evidence/base.txt
       - uses: actions/upload-artifact@v4
         with:
           name: cpython-2385254-source
-          path: ../source/
+          path: source_archive/
           retention-days: 7
       - name: Build a debug interpreter
         run: |
           set -euo pipefail
-          ./configure --with-pydebug --without-ensurepip > ../evidence/configure.log 2>&1
-          make -j4 > ../evidence/build.log 2>&1
-          ./python -VV | tee ../evidence/python.txt
+          ./configure --with-pydebug --without-ensurepip > evidence/configure.log 2>&1
+          make -j4 > evidence/build.log 2>&1
+          ./python -VV | tee evidence/python.txt
       - name: Add byte-preservation regressions
         run: |
           python3 - <<'PY'
@@ -100,12 +100,12 @@ jobs:
           set -euo pipefail
           for n in 1 2; do
             set +e
-            ./python -m unittest -v test.test_email.test_parser.TestBytesParser > ../evidence/before-$n.log 2>&1
+            ./python -m unittest -v test.test_email.test_parser.TestBytesParser > evidence/before-$n.log 2>&1
             code=$?
             set -e
             test "$code" = 1
-            grep -q 'AssertionError' ../evidence/before-$n.log
-            if grep -q '^ERROR:' ../evidence/before-$n.log; then cat ../evidence/before-$n.log; exit 1; fi
+            grep -q 'AssertionError' evidence/before-$n.log
+            if grep -q '^ERROR:' evidence/before-$n.log; then cat evidence/before-$n.log; exit 1; fi
           done
       - name: Apply the minimal source fix
         run: |
@@ -124,9 +124,9 @@ jobs:
       - name: Verify regressions and related suites after the fix
         run: |
           set -euo pipefail
-          ./python -m unittest -v test.test_email.test_parser.TestBytesParser > ../evidence/after.log 2>&1
-          ./python -m test -v -j2 test_email test_mailbox test_imaplib test_poplib test_smtplib > ../evidence/suites.log 2>&1
-          ./python -m test -R 3:3 test_email > ../evidence/refleaks.log 2>&1
+          ./python -m unittest -v test.test_email.test_parser.TestBytesParser > evidence/after.log 2>&1
+          ./python -m test -v -j2 test_email test_mailbox test_imaplib test_poplib test_smtplib > evidence/suites.log 2>&1
+          ./python -m test -R 3:3 test_email > evidence/refleaks.log 2>&1
           git diff --check
           git diff --stat
       - name: Publish only validated source changes to a new fork branch
@@ -139,16 +139,16 @@ jobs:
           git add Lib/email/parser.py Lib/test/test_email/test_parser.py Misc/NEWS.d/next/Library/*gh-issue-128949*.rst
           test "$(git diff --cached --name-only | wc -l)" = 3
           git diff --cached --check
-          git diff --cached --binary > ../evidence/fix.patch
+          git diff --cached --binary > evidence/fix.patch
           git config user.name 'Sankalp Thakur'
           git config user.email 'sankalphimself@gmail.com'
           git commit -m 'gh-128949: Preserve payload line endings in BytesParser.parse'
-          git rev-parse HEAD > ../evidence/head.txt
-          git rev-parse HEAD^{tree} > ../evidence/tree.txt
+          git rev-parse HEAD > evidence/head.txt
+          git rev-parse HEAD^{tree} > evidence/tree.txt
           git push origin "HEAD:refs/heads/$branch"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: gh-128949-evidence
-          path: ../evidence/
+          path: evidence/
           retention-days: 14
