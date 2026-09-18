@@ -1,0 +1,185 @@
+name: Wave 2 configparser 96239 validation
+on:
+  push:
+    branches: [validation/wave2-gh-96239-20260918]
+    paths: [.github/workflows/wave2-96239.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BASE_SHA: e2ff498cc03886b73fca0429ee745b04646ad8e0
+      FIX_BRANCH: fix/gh-96239-write-whitespace-keys
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: sankalpsthakur/cpython
+          ref: e2ff498cc03886b73fca0429ee745b04646ad8e0
+          persist-credentials: true
+      - name: Prepare regressions without changing implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          { git rev-parse HEAD; gcc --version | head -1; uname -sm; } > "$RUNNER_TEMP/evidence/environment.txt"
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          test -z "$(git ls-remote --heads origin "$FIX_BRANCH")"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          tests = Path('Lib/test/test_configparser.py')
+          text = tests.read_text()
+          marker = '\n\nclass SortedDict'
+          assert text.count(marker) == 1
+          added = '''
+
+          class WriteWhitespaceKeysTestCase(unittest.TestCase):
+
+              def test_write_rejects_whitespace_keys(self):
+                  keys = (' key', 'key ', '\\tkey', 'key\\t', '\\u00a0key',
+                          'key\\u00a0', ' \\t')
+                  for parser_type in (configparser.ConfigParser,
+                                      configparser.RawConfigParser):
+                      for key in keys:
+                          for section in ('section', configparser.DEFAULTSECT,
+                                          configparser.UNNAMED_SECTION):
+                              for value in ('value', None):
+                                  for spaced in (True, False):
+                                      with self.subTest(parser=parser_type, key=key,
+                                                        section=section,
+                                                        value=value, spaced=spaced):
+                                          parser = parser_type(
+                                              allow_no_value=True,
+                                              allow_unnamed_section=True)
+                                          if section != configparser.DEFAULTSECT:
+                                              parser.add_section(section)
+                                          parser.set(section, 'first', 'keep')
+                                          parser.set(section, key, value)
+                                          with self.assertRaisesRegex(
+                                                  configparser.InvalidWriteError,
+                                                  'leading or trailing whitespace'):
+                                              parser.write(io.StringIO(),
+                                                           space_around_delimiters=spaced)
+                                          self.assertEqual(parser.get(section, key),
+                                                           value)
+                                          self.assertEqual(parser.get(section, 'first'),
+                                                           'keep')
+
+              def test_write_preserves_internal_whitespace(self):
+                  for key in ('two words', 'two\\twords', 'two\\u00a0words'):
+                      for spaced in (True, False):
+                          with self.subTest(key=key, spaced=spaced):
+                              parser = configparser.ConfigParser(delimiters=('->',))
+                              parser['section'] = {key: 'value'}
+                              output = io.StringIO()
+                              parser.write(output, space_around_delimiters=spaced)
+                              restored = configparser.ConfigParser(delimiters=('->',))
+                              restored.read_string(output.getvalue())
+                              self.assertEqual(dict(restored['section']),
+                                               dict(parser['section']))
+
+              def test_optionxform_can_strip_whitespace(self):
+                  class StrippingParser(configparser.ConfigParser):
+                      def optionxform(self, option):
+                          return super().optionxform(option).strip()
+
+                  parser = StrippingParser()
+                  parser['section'] = {' key ': 'value'}
+                  output = io.StringIO()
+                  parser.write(output)
+                  restored = StrippingParser()
+                  restored.read_string(output.getvalue())
+                  self.assertEqual(dict(restored['section']), {'key': 'value'})
+          '''
+          tests.write_text(text.replace(marker, added + marker))
+          compile(tests.read_text(), str(tests), 'exec')
+          Path(os.environ['RUNNER_TEMP'], 'evidence', 'regression-test.py').write_text(added)
+          PY
+      - name: Build pinned debug CPython
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./configure --with-pydebug --without-ensurepip > "$RUNNER_TEMP/evidence/configure.log" 2>&1
+          make -j2 > "$RUNNER_TEMP/evidence/build.log" 2>&1
+          ./python -VV | tee -a "$RUNNER_TEMP/evidence/environment.txt"
+      - name: Require the new regression to fail before the fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          ./python -m test -v -m test_write_rejects_whitespace_keys test_configparser > "$RUNNER_TEMP/evidence/before.log" 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 1
+          grep -q 'InvalidWriteError not raised' "$RUNNER_TEMP/evidence/before.log"
+          if grep -q '^ERROR:' "$RUNNER_TEMP/evidence/before.log"; then
+            cat "$RUNNER_TEMP/evidence/before.log"
+            exit 1
+          fi
+          echo 'RED: whitespace-key write was accepted on unchanged implementation'
+      - name: Apply minimal write-time validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          file = Path('Lib/configparser.py')
+          text = file.read_text()
+          old = '''        """Raises an InvalidWriteError for any keys containing
+                  delimiters or that begins with the section header pattern"""
+                  if re.match(self.SECTCRE, key):'''
+          new = '''        """Raise InvalidWriteError for keys that cannot be read back."""
+                  if key != key.strip():
+                      raise InvalidWriteError(
+                          f"Cannot write key {key!r}; leading or trailing whitespace")
+                  if re.match(self.SECTCRE, key):'''
+          assert text.count(old) == 1
+          file.write_text(text.replace(old, new))
+          news = Path('Misc/NEWS.d/next/Library/2026-09-18-03-00-00.gh-issue-96239.SpaceKeys.rst')
+          assert not news.exists()
+          news.write_text(':mod:`configparser` now raises :exc:`~configparser.InvalidWriteError`\n'
+                          'when writing an option name with leading or trailing whitespace,\n'
+                          'which would otherwise be read back as a different option or as a\n'
+                          'continuation of the previous value. In-memory option names are unchanged.\n')
+          PY
+          git diff --check
+      - name: Run affected suites and repeated new tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./python -m test -v test_configparser test_logging test_sysconfig > "$RUNNER_TEMP/evidence/after-suites.log" 2>&1
+          ./python -m test -v -R 3:3 -m '*WriteWhitespaceKeysTestCase*' test_configparser > "$RUNNER_TEMP/evidence/repeated.log" 2>&1
+          tail -25 "$RUNNER_TEMP/evidence/after-suites.log"
+          tail -20 "$RUNNER_TEMP/evidence/repeated.log"
+          git diff --check
+      - name: Publish only the validated source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git ls-remote --heads origin "$FIX_BRANCH")"
+          git switch -c "$FIX_BRANCH"
+          git add Lib/configparser.py Lib/test/test_configparser.py Misc/NEWS.d/next/Library/2026-09-18-03-00-00.gh-issue-96239.SpaceKeys.rst
+          git diff --cached --check
+          python3 - <<'PY'
+          import subprocess
+          files = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert files == ['Lib/configparser.py', 'Lib/test/test_configparser.py', 'Misc/NEWS.d/next/Library/2026-09-18-03-00-00.gh-issue-96239.SpaceKeys.rst'], files
+          PY
+          git config user.name 'Sankalp Thakur'
+          git config user.email 'sankalphimself@gmail.com'
+          git commit -m 'gh-96239: Reject configparser writes with whitespace around keys'
+          git push origin "HEAD:refs/heads/$FIX_BRANCH"
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/head.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/evidence/tree.txt"
+          git show --stat --oneline HEAD > "$RUNNER_TEMP/evidence/changes.txt"
+          git format-patch -1 --stdout > "$RUNNER_TEMP/evidence/gh-96239.patch"
+          echo 'TESTED AND PUSHED TO FORK; no upstream PR created by this job'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: wave2-96239-evidence
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
