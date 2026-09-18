@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 BASE = "854295809ad5a42c9461f34d47b1252a3b4a2027"
-NEWS = "Misc/NEWS.d/next/C API/2026-09-18-01-00-00.gh-issue-157649.cppref.rst"
+NEWS = "Misc/NEWS.d/next/C_API/2026-09-18-01-00-00.gh-issue-157649.cppref.rst"
 TEST = r'''// gh-157649: Reference-counting macros must copy the old pointer, not
 // alias an array element or a C++ reference that is about to be overwritten.
 static int

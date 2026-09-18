@@ -52,7 +52,7 @@ jobs:
         run: |
           python3 ../validation/Tools/gh157649/prepare.py fix
           git diff --check
-          git add Include/pyport.h Lib/test/test_cppext/extension.cpp 'Misc/NEWS.d/next/C API/2026-09-18-01-00-00.gh-issue-157649.cppref.rst'
+          git add Include/pyport.h Lib/test/test_cppext/extension.cpp 'Misc/NEWS.d/next/C_API/2026-09-18-01-00-00.gh-issue-157649.cppref.rst'
           git diff --cached > ../evidence/gh157649.patch
           git diff --cached --stat
       - name: Rebuild and run C and C++ extension suites
