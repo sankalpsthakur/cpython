@@ -1,0 +1,154 @@
+name: Email binary parser regression validation
+on:
+  push:
+    branches: [validation/gh-128949-20260918]
+    paths: [.github/workflows/oss-five-128949.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/cpython'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 23852543ed8026457cca5a6b8e19de819bbe58fe
+      - name: Preserve immutable source for inspection
+        run: |
+          mkdir -p ../evidence ../source
+          git archive --format=tar.gz HEAD > ../source/cpython-2385254.tar.gz
+          git rev-parse HEAD > ../evidence/base.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpython-2385254-source
+          path: ../source/
+          retention-days: 7
+      - name: Build a debug interpreter
+        run: |
+          set -euo pipefail
+          ./configure --with-pydebug --without-ensurepip > ../evidence/configure.log 2>&1
+          make -j4 > ../evidence/build.log 2>&1
+          ./python -VV | tee ../evidence/python.txt
+      - name: Add byte-preservation regressions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Lib/test/test_email/test_parser.py')
+          text = path.read_text()
+          needle = "class TestBytesParser(TestParserBase, TestEmailBase):\n    parsers = (message_from_bytes, message_from_binary_file)\n"
+          assert text.count(needle) == 1
+          tests = '''
+              def test_parse_preserves_payload_line_endings(self):
+                  for policy in (email.policy.compat32, default):
+                      for content_type in ('text/plain', 'application/octet-stream'):
+                          for cte in ('7bit', '8bit', 'binary'):
+                              with self.subTest(policy=policy, content_type=content_type,
+                                                cte=cte):
+                                  payload = b'a\\r\\nb\\rc\\n'
+                                  if cte != '7bit':
+                                      payload += b'\\x00\\x80\\xff\\r\\n'
+                                  source = (
+                                      f'Content-Type: {content_type}\\r\\n'
+                                      f'Content-Transfer-Encoding: {cte}\\r\\n'
+                                      '\\r\\n'
+                                  ).encode('ascii') + payload
+                                  fp = io.BytesIO(source)
+                                  msg = email.message_from_binary_file(fp, policy=policy)
+                                  expected = email.message_from_bytes(source, policy=policy)
+                                  self.assertEqual(msg.get_payload(decode=True), payload)
+                                  self.assertEqual(msg.get_payload(), expected.get_payload())
+                                  self.assertFalse(fp.closed)
+
+              def test_parse_preserves_multipart_binary_payload(self):
+                  payload = b'GIF89a\\x0a\\x00\\x0d\\x0a\\x80\\xff\\rEND'
+                  source = (
+                      b'MIME-Version: 1.0\\r\\n'
+                      b'Content-Type: multipart/mixed; boundary=boundary\\r\\n'
+                      b'\\r\\n--boundary\\r\\n'
+                      b'Content-Type: image/gif\\r\\n'
+                      b'Content-Transfer-Encoding: binary\\r\\n\\r\\n'
+                      + payload + b'\\r\\n--boundary--\\r\\n'
+                  )
+                  msg = email.message_from_binary_file(io.BytesIO(source), policy=default)
+                  self.assertTrue(msg.is_multipart())
+                  self.assertEqual(msg.get_payload(0).get_content(), payload)
+
+              def test_parse_preserves_newline_across_read_boundary(self):
+                  headers = b'Content-Type: application/octet-stream\\r\\n\\r\\n'
+                  payload = b'x' * (8191 - len(headers)) + b'\\r\\nend\\r'
+                  msg = email.message_from_binary_file(
+                      io.BytesIO(headers + payload), policy=default)
+                  self.assertEqual(msg.get_content(), payload)
+
+              def test_parse_headers_only_preserves_body(self):
+                  from email.parser import BytesHeaderParser
+                  source = b'Subject: test\\r\\n\\r\\na\\r\\nb\\rc\\n'
+                  fp = io.BytesIO(source)
+                  msg = BytesHeaderParser(policy=default).parse(fp)
+                  self.assertEqual(msg['Subject'], 'test')
+                  self.assertEqual(msg.get_payload(), 'a\\r\\nb\\rc\\n')
+                  self.assertFalse(fp.closed)
+          '''
+          import textwrap
+          tests = textwrap.indent(textwrap.dedent(tests), '    ')
+          path.write_text(text.replace(needle, needle + '\n' + tests))
+          compile(path.read_text(), str(path), 'exec')
+          PY
+      - name: Require the regression to fail before the fix
+        run: |
+          set -euo pipefail
+          for n in 1 2; do
+            set +e
+            ./python -m unittest -v test.test_email.test_parser.TestBytesParser > ../evidence/before-$n.log 2>&1
+            code=$?
+            set -e
+            test "$code" = 1
+            grep -q 'AssertionError' ../evidence/before-$n.log
+            if grep -q '^ERROR:' ../evidence/before-$n.log; then cat ../evidence/before-$n.log; exit 1; fi
+          done
+      - name: Apply the minimal source fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Lib/email/parser.py')
+          text = path.read_text()
+          old = "        fp = TextIOWrapper(fp, encoding='ascii', errors='surrogateescape')"
+          new = "        fp = TextIOWrapper(fp, encoding='ascii', errors='surrogateescape',\n                           newline='')"
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, new))
+          news = Path('Misc/NEWS.d/next/Library/2026-09-18-03-00-00.gh-issue-128949.Kb7Nq2.rst')
+          assert not news.exists()
+          news.write_text('Preserve line endings in :meth:`email.parser.BytesParser.parse` and\n:meth:`~email.parser.BytesHeaderParser.parse`. This prevents corruption of\nunencoded binary payloads and makes parsing a binary file consistent with\nparsing the same content using ``parsebytes()``.\n')
+          PY
+      - name: Verify regressions and related suites after the fix
+        run: |
+          set -euo pipefail
+          ./python -m unittest -v test.test_email.test_parser.TestBytesParser > ../evidence/after.log 2>&1
+          ./python -m test -v -j2 test_email test_mailbox test_imaplib test_poplib test_smtplib > ../evidence/suites.log 2>&1
+          ./python -m test -R 3:3 test_email > ../evidence/refleaks.log 2>&1
+          git diff --check
+          git diff --stat
+      - name: Publish only validated source changes to a new fork branch
+        run: |
+          set -euo pipefail
+          branch=fix/gh-128949-email-newlines
+          remote=$(git ls-remote --heads origin "refs/heads/$branch")
+          test -z "$remote"
+          git switch -c "$branch"
+          git add Lib/email/parser.py Lib/test/test_email/test_parser.py Misc/NEWS.d/next/Library/*gh-issue-128949*.rst
+          test "$(git diff --cached --name-only | wc -l)" = 3
+          git diff --cached --check
+          git diff --cached --binary > ../evidence/fix.patch
+          git config user.name 'Sankalp Thakur'
+          git config user.email 'sankalphimself@gmail.com'
+          git commit -m 'gh-128949: Preserve payload line endings in BytesParser.parse'
+          git rev-parse HEAD > ../evidence/head.txt
+          git rev-parse HEAD^{tree} > ../evidence/tree.txt
+          git push origin "HEAD:refs/heads/$branch"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gh-128949-evidence
+          path: ../evidence/
+          retention-days: 14
