@@ -1,0 +1,188 @@
+name: Bend 790 isolated validation
+on:
+  push:
+    branches: [validation/bend-790-20260918]
+    paths: [.github/workflows/bend-790-validation.yml]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BUN_JSC_maxPerThreadStackUsage: '33554432'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bendlang/bend
+          ref: e6676b080f25b1bc1bf5b5b7d7a17e22f8022599
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.3
+      - name: Reproduce, patch and test without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          { git rev-parse HEAD; bun --version; node --version; clang --version; } | tee evidence/environment.txt
+          cat > /tmp/validate-bend.py <<'PY'
+          import concurrent.futures
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+
+          root = Path.cwd()
+          evidence = root / 'evidence'
+          report = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}
+          compiler = root / 'bend2/comp.ts'
+          protected = hashlib.sha256((root / 'bend2/bend.ts').read_bytes()).hexdigest()
+          original = compiler.read_text()
+          needle = '  return "$" + k.replace(/[./~]/g, "$") + "$";'
+          replacement = '  return "$" + k.replace(/[$./~]/g, (c) =>\n    "$" + c.charCodeAt(0).toString(16) + "$") + "$";'
+          assert original.count(needle) == 1, 'Pinned source no longer matches'
+          regression = root / 'tests/comptime/name_mangling.bend'
+          assert not regression.exists()
+          regression.write_text('''import Base
+
+          def inc(x: Nat) -> Nat:
+            1n + x
+
+          def helper.map(~f: Nat -> Nat, x: Nat) -> Nat:
+            f(x)
+
+          def caller() -> Nat:
+            helper.map(~inc, 1n)
+
+          def helper.map.0(f: Nat -> Nat, x: Nat) -> Nat:
+            999n
+
+          def main() -> IO(Unit):
+            do IO<Unit>:
+              IO.print(Nat.show(caller()))
+              IO.print(Nat.show(helper.map.0(inc, 1n)))
+
+          #|2
+          #|999
+          ''')
+          def tidy(s):
+              return re.sub(r'[ \t]+$', '', s, flags=re.M).strip()
+          def command(args, timeout=120):
+              try:
+                  p = subprocess.run(args, cwd=root, text=True, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, timeout=timeout)
+                  return {'exit': p.returncode, 'stdout': p.stdout, 'stderr': p.stderr}
+              except subprocess.TimeoutExpired:
+                  return {'exit': 124, 'stdout': '', 'stderr': 'validation timeout'}
+          def expect(got, wanted):
+              return got['exit'] == 0 and tidy(got['stdout']) == wanted
+          def lanes(file):
+              wanted = tidy('\n'.join(s[2:] for s in file.read_text().splitlines() if s.startswith('#|')))
+              result = {'file': str(file.relative_to(root)), 'expected': wanted}
+              with tempfile.TemporaryDirectory(prefix='bend-790-') as tmp:
+                  js = str(Path(tmp) / 'main.js')
+                  binary = str(Path(tmp) / 'main')
+                  result['interpreted'] = command(['bun', 'bend2/main.ts', str(file)])
+                  result['build_js'] = command(['bun', 'bend2/main.ts', str(file), '-o', js])
+                  if result['build_js']['exit'] == 0:
+                      result['bun'] = command(['bun', js], 30)
+                      result['node'] = command(['node', js], 30)
+                  result['build_c'] = command(['bun', 'bend2/main.ts', str(file), '-o', binary])
+                  if result['build_c']['exit'] == 0:
+                      result['c'] = command([binary], 30)
+              result['pass'] = all(expect(result.get(k, {'exit': 1}), wanted)
+                                   for k in ['interpreted', 'bun', 'node', 'c'])
+              return result
+          def save():
+              (evidence / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
+          try:
+              report['before'] = [lanes(regression), lanes(regression)]
+              save()
+              for before in report['before']:
+                  assert before['build_js']['exit'] == 0, before
+                  assert expect(before.get('c', {'exit': 1}), before['expected']), before
+                  assert not expect(before.get('bun', {'exit': 1}), before['expected']), before
+              compiler.write_text(original.replace(needle, replacement))
+              report['after'] = [lanes(regression), lanes(regression)]
+              save()
+              assert all(r['pass'] for r in report['after']), report['after']
+              print('Regression: original JS fails twice; patched interpreter/Bun/Node/C pass twice', flush=True)
+              # Exercise the exact mangler body extracted from the patched source.
+              body = re.search(r'function js_sat\(k: Bend.Name\): string \{(.*?)\n\}', compiler.read_text(), re.S).group(1)
+              probe = 'const m = new Function("k", ' + json.dumps(body) + ');\n' + '''
+          const assert = require('node:assert/strict');
+          const seen = new Map();
+          const alphabet = ['a', '_', '.', '/', '~', '$'];
+          function visit(s, left) {
+            const id = m(s);
+            assert.match(id, /^[$A-Z_a-z][$\\w]*$/);
+            assert.ok(!seen.has(id), JSON.stringify([s, seen.get(id), id]));
+            seen.set(id, s);
+            if (left) for (const c of alphabet) visit(s + c, left - 1);
+          }
+          visit('', 6);
+          console.log(seen.size + ' unique names, no collisions');
+          '''
+              (evidence / 'mangler-test.cjs').write_text(probe)
+              report['mangler'] = command(['node', str(evidence / 'mangler-test.cjs')])
+              save()
+              assert report['mangler']['exit'] == 0, report['mangler']
+              print(report['mangler']['stdout'].strip(), flush=True)
+              # Existing pure programs only: no hardware, network, or cluster access.
+              selected = []
+              for namespace in ['comptime', 'run', 'show']:
+                  folder = root / 'tests' / namespace
+                  if not folder.is_dir():
+                      continue
+                  for file in sorted(folder.glob('*.bend')):
+                      text = file.read_text()
+                      expected = tidy('\n'.join(s[2:] for s in text.splitlines() if s.startswith('#|')))
+                      if (file != regression and re.search(r'^import Base$', text, re.M)
+                          and re.search(r'^def main\(\) -> (?:Nat|U32|F32|Bool|String|Unit):', text, re.M)
+                          and expected and not expected.startswith('Error:')
+                          and 'IO(' not in text and '!(' not in text and '@unsafe' not in text
+                          and not re.search(r'^\s*import "', text, re.M)):
+                          selected.append(file)
+              assert selected, 'No existing regression controls selected'
+              print(f'Checking {len(selected)} existing pure programs in four execution modes', flush=True)
+              with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                  report['controls'] = list(pool.map(lanes, selected))
+              save()
+              bad = [r for r in report['controls'] if not r['pass']]
+              report['control_failures'] = [r['file'] for r in bad]
+              # Compare failures with untouched source, never relabel failures as passes.
+              if bad:
+                  compiler.write_text(original)
+                  report['control_baseline'] = [lanes(root / r['file']) for r in bad]
+                  compiler.write_text(original.replace(needle, replacement))
+              save()
+              assert not bad, report['control_failures']
+              assert hashlib.sha256((root / 'bend2/bend.ts').read_bytes()).hexdigest() == protected
+              subprocess.run(['git', 'add', '-N', str(regression)], check=True)
+              subprocess.run(['git', 'diff', '--check'], check=True)
+              report['changed_files'] = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+              assert report['changed_files'] == ['bend2/comp.ts', 'tests/comptime/name_mangling.bend'], report['changed_files']
+              report['protected_checker_unchanged'] = True
+              report['status'] = 'tested; not submitted'
+              save()
+              print(f'PASS: {len(selected)} existing programs plus the regression; protected checker unchanged', flush=True)
+          finally:
+              subprocess.run(['git', 'add', '-N', str(regression)], check=False)
+              patch = subprocess.check_output(['git', 'diff', '--binary', '--', 'bend2/comp.ts', 'tests/comptime/name_mangling.bend'])
+              (evidence / 'bend-790.patch').write_bytes(patch)
+              (evidence / 'comp.ts').write_text(compiler.read_text())
+              (evidence / 'name_mangling.bend').write_text(regression.read_text())
+              save()
+          PY
+          python3 /tmp/validate-bend.py | tee evidence/summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bend-790-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
