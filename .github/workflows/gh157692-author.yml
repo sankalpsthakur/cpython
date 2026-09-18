@@ -1,0 +1,32 @@
+name: Correct gh-157692 author identity
+on:
+  push:
+    branches: [validation/gh-157692-author-20260918]
+permissions:
+  contents: write
+jobs:
+  author:
+    if: github.repository == 'sankalpsthakur/cpython'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/gh-157692-venv-batch-path
+          fetch-depth: 2
+      - name: Correct only the commit identity
+        env:
+          EXPECTED: b9bdc56f37984befe13e2a66f44f4cf258cf46af
+          BRANCH: refs/heads/fix/gh-157692-venv-batch-path
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          test "$(git log -1 --format=%an)" = 'Sankalp Thakur'
+          test "$(git log -1 --format=%ae)" = '31366524+sankalpsthakur@users.noreply.github.com'
+          tree=$(git rev-parse HEAD^{tree})
+          parent=$(git rev-parse HEAD^)
+          git -c user.name='Sankalp Thakur' -c user.email='sankalphimself@gmail.com' commit --amend --no-edit --author='Sankalp Thakur <sankalphimself@gmail.com>'
+          test "$(git rev-parse HEAD^{tree})" = "$tree"
+          test "$(git rev-parse HEAD^)" = "$parent"
+          git diff --exit-code "$EXPECTED" HEAD
+          git push --force-with-lease="$BRANCH:$EXPECTED" origin "HEAD:$BRANCH"
+          printf 'Identity-only correction, unchanged tree %s, new commit %s\n' "$tree" "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
