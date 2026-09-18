@@ -1,0 +1,87 @@
+name: gh-157649 C++ regression validation
+on:
+  push:
+    branches: [validation/gh-157649-20260918]
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/cpython'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: sankalpsthakur/cpython
+          ref: 854295809ad5a42c9461f34d47b1252a3b4a2027
+          path: source
+          fetch-depth: 1
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev libzstd-dev clang
+      - name: Add regression tests to unchanged upstream
+        working-directory: source
+        run: |
+          python3 ../validation/Tools/gh157649/prepare.py tests
+          git diff --check
+      - name: Build unchanged CPython runtime
+        working-directory: source
+        run: |
+          set -o pipefail
+          mkdir -p ../evidence
+          ./configure --with-pydebug 2>&1 | tee ../evidence/configure.log
+          make -j2 2>&1 | tee ../evidence/build-before.log
+      - name: Require regression failure before the fix
+        working-directory: source
+        run: |
+          set +e
+          ./python -m test -v -u cpu,network -m test_build_cpp11 test_cppext > ../evidence/before.log 2>&1
+          status=$?
+          set -e
+          cat ../evidence/before.log
+          test "$status" -ne 0
+          grep -E 'Fatal Python error: Segmentation fault|test_refcount_macros.*Assertion|Assertion.*test_refcount_macros' ../evidence/before.log
+          echo "Baseline failed as expected: exit $status" >> "$GITHUB_STEP_SUMMARY"
+      - name: Apply minimal C++ fallback fix
+        working-directory: source
+        run: |
+          python3 ../validation/Tools/gh157649/prepare.py fix
+          git diff --check
+          git add Include/pyport.h Lib/test/test_cppext/extension.cpp 'Misc/NEWS.d/next/C API/2026-09-18-01-00-00.gh-issue-157649.cppref.rst'
+          git diff --cached > ../evidence/gh157649.patch
+          git diff --cached --stat
+      - name: Rebuild and run C and C++ extension suites
+        working-directory: source
+        run: |
+          set -o pipefail
+          make -j2 2>&1 | tee ../evidence/build-after.log
+          ./python -m test -v -u cpu,network test_cppext test_cext 2>&1 | tee ../evidence/after-gcc.log
+      - name: Check C++ extensions with Clang and strict aliasing
+        working-directory: source
+        env:
+          CC: clang
+          CXX: clang++
+          CPYTHON_TEST_EXTRA_CFLAGS: -O2 -fstrict-aliasing
+        run: |
+          set -o pipefail
+          ./python -m test -v -u cpu,network test_cppext 2>&1 | tee ../evidence/after-clang.log
+      - name: Publish only the three validated source changes
+        working-directory: source
+        run: |
+          test "$(git diff --cached --name-only | wc -l)" -eq 3
+          git diff --cached --check
+          git -c user.name='Sankalp Thakur' -c user.email='sankalphimself@gmail.com' commit -m 'gh-157649: Use the memcpy refcount macros in C++' -m 'Add C++ regression coverage for array elements, reference variables, single evaluation, null destinations, and typed pointers. Prepared with AI coding assistance.'
+          git push origin HEAD:refs/heads/fix/gh-157649-cpp-refcount
+          git rev-parse HEAD | tee ../evidence/commit.txt
+          printf 'Validated fix commit: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gh157649-evidence
+          path: evidence/
+          retention-days: 14
