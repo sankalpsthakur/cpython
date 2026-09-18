@@ -271,6 +271,108 @@ static PyMethodDef _testcppext_methods[] = {
 };
 
 
+// gh-157649: Reference-counting macros must copy the old pointer, not
+// alias an array element or a C++ reference that is about to be overwritten.
+static int
+test_refcount_macros(void)
+{
+    PyObject *old_obj = PyList_New(0);
+    if (old_obj == _Py_NULL) {
+        return -1;
+    }
+    const Py_ssize_t old_refcnt = Py_REFCNT(old_obj);
+    PyObject *objects[1] = {Py_NewRef(old_obj)};
+    int index = 0;
+
+    Py_CLEAR(objects[index++]);
+    assert(index == 1);
+    assert(objects[0] == _Py_NULL);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+    Py_CLEAR(objects[0]);  // A null destination is also valid.
+
+    PyObject *&object_ref = objects[0];
+    object_ref = Py_NewRef(old_obj);
+    Py_CLEAR(object_ref);
+    assert(objects[0] == _Py_NULL);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+
+    objects[0] = Py_NewRef(old_obj);
+    Py_CLEAR((objects[0]));
+    assert(objects[0] == _Py_NULL);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+
+#ifndef Py_LIMITED_API
+    PyObject *new_obj = PyList_New(0);
+    if (new_obj == _Py_NULL) {
+        Py_DECREF(old_obj);
+        return -1;
+    }
+    const Py_ssize_t new_refcnt = Py_REFCNT(new_obj);
+    PyObject *sources[1] = {new_obj};
+    int source_index = 0;
+
+    objects[0] = Py_NewRef(old_obj);
+    index = 0;
+    Py_SETREF(objects[index++], Py_NewRef(sources[source_index++]));
+    assert(index == 1 && source_index == 1);
+    assert(objects[0] == new_obj);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+    assert(Py_REFCNT(new_obj) == new_refcnt + 1);
+    Py_CLEAR(objects[0]);
+
+    object_ref = Py_NewRef(old_obj);
+    Py_SETREF(object_ref, Py_NewRef(new_obj));
+    assert(objects[0] == new_obj);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+    assert(Py_REFCNT(new_obj) == new_refcnt + 1);
+    Py_CLEAR(objects[0]);
+
+    objects[0] = Py_NewRef(old_obj);
+    index = source_index = 0;
+    Py_XSETREF(objects[index++], Py_NewRef(sources[source_index++]));
+    assert(index == 1 && source_index == 1);
+    assert(objects[0] == new_obj);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+    assert(Py_REFCNT(new_obj) == new_refcnt + 1);
+    Py_CLEAR(objects[0]);
+
+    object_ref = Py_NewRef(old_obj);
+    Py_XSETREF(object_ref, Py_NewRef(new_obj));
+    assert(objects[0] == new_obj);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+    assert(Py_REFCNT(new_obj) == new_refcnt + 1);
+    Py_XSETREF(objects[0], _Py_NULL);
+    assert(objects[0] == _Py_NULL);
+    assert(Py_REFCNT(new_obj) == new_refcnt);
+
+    Py_XSETREF(objects[0], Py_NewRef(new_obj));
+    assert(objects[0] == new_obj);
+    assert(Py_REFCNT(new_obj) == new_refcnt + 1);
+    Py_CLEAR(objects[0]);
+    assert(Py_REFCNT(new_obj) == new_refcnt);
+    Py_XSETREF(objects[0], _Py_NULL);
+
+    // Keep the existing strict-aliasing-safe support for typed pointers.
+    PyListObject *list_obj = (PyListObject *)Py_NewRef(old_obj);
+    Py_CLEAR(list_obj);
+    assert(list_obj == _Py_NULL);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+    list_obj = (PyListObject *)Py_NewRef(old_obj);
+    Py_SETREF(list_obj, (PyListObject *)Py_NewRef(new_obj));
+    assert((PyObject *)list_obj == new_obj);
+    assert(Py_REFCNT(old_obj) == old_refcnt);
+    assert(Py_REFCNT(new_obj) == new_refcnt + 1);
+    Py_XSETREF(list_obj, _Py_NULL);
+    assert(list_obj == _Py_NULL);
+    assert(Py_REFCNT(new_obj) == new_refcnt);
+    Py_DECREF(new_obj);
+#endif
+
+    Py_DECREF(old_obj);
+    return 0;
+}
+
+
 static int
 _testcppext_exec(PyObject *module)
 {
@@ -297,6 +399,10 @@ _testcppext_exec(PyObject *module)
     result = PyObject_CallMethod(module, "test_datetime", "");
     if (!result) return -1;
     Py_DECREF(result);
+
+    if (test_refcount_macros() < 0) {
+        return -1;
+    }
 
     // test Py_BUILD_ASSERT() and Py_BUILD_ASSERT_EXPR()
     Py_BUILD_ASSERT(sizeof(int) == sizeof(unsigned int));

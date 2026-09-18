@@ -1,0 +1,4 @@
+Fix a C++ regression in :c:macro:`Py_CLEAR`, :c:macro:`Py_SETREF`,
+and :c:macro:`Py_XSETREF` that could corrupt reference counts or crash
+when used with array elements or reference variables. Use the existing
+``memcpy()`` implementations in C++ instead of ``decltype()``.
